@@ -382,9 +382,11 @@ class TunaInference:
             return self.edit(data, **kwargs)
         if self.inference_mode == "mmu":
             return self.mmu(data, **kwargs)
+        if self.inference_mode in {"mixed_modal", "temporal_interleaved"}:
+            return self.mixed_modal(data, **kwargs)
         raise ValueError(
             f"Unknown inference mode: {self.inference_mode!r}. "
-            "Supported modes are 't2i', 'edit', 'mmu'."
+            "Supported modes are 't2i', 'edit', 'mmu', and 'mixed_modal'."
         )
 
     # ---- t2i ---------------------------------------------------------------
@@ -655,3 +657,46 @@ class TunaInference:
         )
 
         return {"generated_text": result, "task_type": "understanding"}
+
+    # ---- mixed-modal / temporal interleaved -------------------------------
+    def mixed_modal(self, data: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        segments = data.get("segments")
+        if not isinstance(segments, list):
+            raise ValueError("mixed_modal inference requires data['segments'] as a list.")
+
+        seed = kwargs.get("seed", 42)
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+
+        generated = self.pipe.mixed_modal_generate(
+            segments=segments,
+            max_new_items=kwargs.get("max_new_items", self.num_images_per_prompt),
+            max_new_text_tokens=kwargs.get("max_new_text_tokens", self.max_new_tokens),
+            num_inference_steps=kwargs.get("num_inference_steps", self.num_inference_steps),
+            guidance_scale=kwargs.get("guidance_scale", self.guidance_scale),
+            negative_prompt=kwargs.get("negative_prompt", self.negative_prompt),
+            sampling_method=kwargs.get("sampling_method", self.sampling_method),
+            time_shifting_factor=self.shift,
+            noise_scale=self.noise_scale,
+            do_sample=self.do_sample,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+        )
+
+        visuals = []
+        texts = []
+        for item in generated:
+            if item["type"] == "text":
+                texts.append(item["text"])
+            elif "tensor" in item:
+                visuals.append(item["tensor"])
+
+        return {
+            "generated": generated,
+            "generated_text": texts,
+            "generated_image": visuals,
+            "task_type": "mixed_modal",
+        }

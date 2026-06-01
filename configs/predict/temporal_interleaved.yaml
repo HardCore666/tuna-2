@@ -1,0 +1,28 @@
+defaults:
+  - model: tuna_2_pixel_7b
+  - _self_
+
+inference:
+  inference_mode: mixed_modal
+  pipe: Tuna2PixelPipeline
+  generation_mode: t2i_pixel
+  output_dir: ./outputs/predictions/temporal_interleaved
+  height: 512
+  width: 512
+  latent_frames: 1
+  guidance_scale: 3.0
+  num_inference_steps: 50
+  num_images_per_prompt: 4
+  max_new_tokens: 160
+  do_sample: false
+  temperature: 1.0
+  top_k: null
+  top_p: null
+  weight_dtype: bf16
+  noise_scale: 1.0
+  sampling_method: euler
+  negative_prompt: ""
+
+segments:
+  - type: text
+    text: "A person walks into a quiet room."

@@ -283,6 +283,117 @@ def format_sequence_gen_qwen2_5_edit(
     return text_tokens_t, text_labels_t, modality_positions, text_mask, image_mask
 
 
+def format_temporal_interleaved_sequence(
+    segments: list[dict],
+    bos_id: int,
+    eos_id: int,
+    boi_id: int,
+    eoi_id: int,
+    pad_id: int,
+    img_pad_id: int,
+    num_image_tokens: int,
+    max_seq_len: int,
+    max_images: int,
+    train_image_boundary_tokens: bool = True,
+    bov_id: int | None = None,
+    eov_id: int | None = None,
+    vid_pad_id: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Format a time-ordered image-text sequence for mixed-modal training.
+
+    The layout follows the Show-o2-style general interleaved format:
+
+        [BOS] text [BOI] image [EOI] text [BOI] image [EOI] ... [EOS]
+
+    Each segment carries a boolean ``target`` flag. Prefix/context text is
+    masked from next-token prediction, future text contributes to the language
+    loss, and future image spans contribute to the flow/JiT loss through
+    ``image_mask``. ``image_target_mask`` is span-level metadata used by the
+    model wrapper to keep prefix images clean while adding noise to future
+    images.
+    """
+    tokens: list[int] = [bos_id]
+    labels: list[int] = [-100]
+    image_mask_values: list[int] = [0]
+    modality_positions: list[list[int]] = []
+    image_target_values: list[int] = []
+
+    for segment in segments:
+        kind = str(segment.get("type", "")).lower()
+        is_target = bool(segment.get("target", False))
+        if kind == "text":
+            text_tokens = [int(x) for x in segment.get("tokens", [])]
+            tokens.extend(text_tokens)
+            labels.extend(text_tokens if is_target else [-100] * len(text_tokens))
+            image_mask_values.extend([0] * len(text_tokens))
+        elif kind in {"image", "video"}:
+            if len(modality_positions) >= max_images:
+                continue
+            start_id = bov_id if kind == "video" and bov_id is not None else boi_id
+            end_id = eov_id if kind == "video" and eov_id is not None else eoi_id
+            pad_token_id = (
+                vid_pad_id
+                if kind == "video" and vid_pad_id is not None
+                else img_pad_id
+            )
+
+            tokens.append(start_id)
+            labels.append(start_id if is_target and train_image_boundary_tokens else -100)
+            image_mask_values.append(0)
+
+            offset = len(tokens)
+            tokens.extend([pad_token_id] * num_image_tokens)
+            labels.extend([-100] * num_image_tokens)
+            image_mask_values.extend([1 if is_target else 0] * num_image_tokens)
+            modality_positions.append([offset, num_image_tokens])
+            image_target_values.append(1 if is_target else 0)
+
+            tokens.append(end_id)
+            labels.append(end_id if is_target and train_image_boundary_tokens else -100)
+            image_mask_values.append(0)
+        else:
+            raise ValueError(f"Unknown temporal interleaved segment type: {kind!r}")
+
+    tokens.append(eos_id)
+    labels.append(eos_id if any(bool(s.get("target", False)) for s in segments) else -100)
+    image_mask_values.append(0)
+
+    if len(tokens) > max_seq_len:
+        raise ValueError(
+            f"Interleaved sequence length {len(tokens)} exceeds max_seq_len={max_seq_len}. "
+            "Use fewer images, shorter text, or a larger max_text_length."
+        )
+
+    pad_len = max_seq_len - len(tokens)
+    tokens.extend([pad_id] * pad_len)
+    labels.extend([-100] * pad_len)
+    image_mask_values.extend([0] * pad_len)
+
+    while len(modality_positions) < max_images:
+        modality_positions.append([-1, -1])
+        image_target_values.append(0)
+
+    text_tokens_t = torch.tensor(tokens)
+    text_labels_t = torch.tensor(labels)
+    image_mask_t = torch.tensor(image_mask_values)
+    visual_pad_mask = text_tokens_t != img_pad_id
+    if vid_pad_id is not None:
+        visual_pad_mask = visual_pad_mask & (text_tokens_t != vid_pad_id)
+    text_mask = torch.where(
+        visual_pad_mask & (text_tokens_t != pad_id),
+        torch.ones_like(text_tokens_t),
+        torch.zeros_like(text_tokens_t),
+    )
+    return (
+        text_tokens_t,
+        text_labels_t,
+        torch.tensor(modality_positions),
+        text_mask,
+        image_mask_t,
+        torch.tensor(image_target_values),
+    )
+
+
 def format_sequence_und(
     text_tokens: list[int],
     bos_id: int,

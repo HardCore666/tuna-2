@@ -345,7 +345,7 @@ class Tuna2Pixel(TunaInnerBase):
             num_imgs = 0
             for i, modality_batch in enumerate(modality_positions):
                 for _, (offset, length) in enumerate(modality_batch):
-                    if length == 0:
+                    if offset < 0 or length <= 0:
                         break
                     else:
                         x0_pred_.append(x0_pred[i, offset : offset + length])
@@ -535,6 +535,83 @@ class Tuna2Pixel(TunaInnerBase):
             # Apply classifier-free guidance
             v = v_uncond + guidance_scale * (v_cond - v_uncond)
             return torch.cat([v, v], dim=0)
+
+    @torch.no_grad()
+    def mixed_modal_generate(
+        self,
+        image_latents=None,
+        t=None,
+        text_tokens=None,
+        attention_mask=None,
+        diffhead_attention_mask=None,
+        modality_positions=None,
+        max_seq_len=None,
+        guidance_scale=0.0,
+        context_image_latents=None,
+        **kwargs,
+    ):
+        """Generate the final image span in an ordered interleaved sequence.
+
+        ``context_image_latents`` contains the clean prefix images already
+        present in ``text_tokens``. ``image_latents`` is the noisy future image
+        being sampled. This mirrors Show-o2 mixed-modality generation: prefix
+        images remain clean context while the next image is produced by the
+        flow/JiT head.
+        """
+        if context_image_latents is None:
+            context_image_latents = image_latents.new_zeros(
+                image_latents.shape[0], 0, *image_latents.shape[1:]
+            )
+        if context_image_latents.dim() == 5:
+            context_image_latents = context_image_latents.unsqueeze(0)
+
+        batch_size = text_tokens.shape[0]
+        num_context = context_image_latents.shape[1]
+        num_images = num_context + 1
+        per_sample_latents = []
+        per_sample_t = []
+        for i in range(batch_size):
+            per_sample_latents.append(
+                torch.cat([context_image_latents[i], image_latents[i : i + 1]], dim=0)
+            )
+            per_sample_t.append(
+                torch.cat(
+                    [
+                        torch.ones(num_context, device=t.device, dtype=t.dtype),
+                        t[i : i + 1],
+                    ],
+                    dim=0,
+                )
+            )
+        image_latents_final = torch.cat(per_sample_latents, dim=0)
+        t_final = torch.cat(per_sample_t, dim=0)
+
+        _, pred = self(
+            text_tokens,
+            image_latents=image_latents_final,
+            t=t_final,
+            attention_mask=attention_mask,
+            diffhead_attention_mask=diffhead_attention_mask,
+            modality_positions=modality_positions,
+            guidance_scale=guidance_scale,
+            output_hidden_states=True,
+            max_seq_len=max_seq_len,
+        )
+        target_indices = torch.arange(
+            num_images - 1,
+            pred.shape[0],
+            num_images,
+            device=pred.device,
+        )
+        pred = pred.index_select(0, target_indices)
+
+        if guidance_scale > 0.0:
+            if pred.shape[0] % 2 != 0:
+                raise ValueError("mixed_modal CFG expects [cond, uncond] batches.")
+            pred_cond, pred_uncond = torch.chunk(pred, 2)
+            pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+            return torch.cat([pred, pred], dim=0)
+        return pred
 
     @torch.no_grad()
     def t2i_generate_edit(
@@ -833,18 +910,27 @@ class Tuna2PixelModel(JiTWrapperMixin, TunaWrapperBase):
         pixel_values_low = batch.get("images_clip", None)
         text_masks = batch["text_masks"]
         image_masks = batch["image_masks"]
+        image_target_masks = batch.get("image_target_masks", None)
         modality_positions = batch["modality_positions"]
         data_type = batch["data_type"]
 
         # Handle interleaved data
-        if data_type[0] == "mmu_interleaved" or data_type[0] == "edit_interleaved":
+        if data_type[0] in {"mmu_interleaved", "edit_interleaved", "temporal_interleaved"}:
             b, n = pixel_values.shape[:2]
-            pixel_values = rearrange(pixel_values, "b n c h w -> (b n) c h w")
-            data_type = data_type * n
+            if pixel_values.dim() == 6:
+                pixel_values = rearrange(pixel_values, "b n c t h w -> (b n) c t h w")
+            else:
+                pixel_values = rearrange(pixel_values, "b n c h w -> (b n) c h w")
+            data_type = [tp for tp in data_type for _ in range(n)]
         if data_type[0] != "mmu_text":
             # Prepare image latents and labels
             image_latents, t, image_labels, image_masks, image_latents_clean = (
-                self.prepare_latents_and_labels(pixel_values, data_type, image_masks)
+                self.prepare_latents_and_labels(
+                    pixel_values,
+                    data_type,
+                    image_masks,
+                    image_target_masks=image_target_masks,
+                )
             )
         else:
             image_latents = None

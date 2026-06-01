@@ -13,12 +13,13 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import numpy as np
 import torch
 from einops import rearrange
 from PIL import Image
+from tuna.data.transforms import build_image_transform
 from tuna.models.misc import prepare_gen_input, prepare_gen_input_edit
 from tuna.pipelines._common import denorm
 from tuna.pipelines._pipeline_base import TunaPipelineBase
@@ -59,10 +60,8 @@ def get_hyper_params(
         calculated_seq_len = (
             latent_width * latent_height * 1 + int(add_aspect_ratio_embeds) * 2 + 1024
         )
-        # Choose between 2048 or 5120 based on which is closer to calculated value
-        diff_2048 = abs(calculated_seq_len - 2048)
-        diff_5120 = abs(calculated_seq_len - 5120)
-        max_seq_len = 2048 if diff_2048 <= diff_5120 else 5120
+        candidates = [2048, 5120, 8192, 16384, 32768]
+        max_seq_len = next((x for x in candidates if x >= calculated_seq_len), candidates[-1])
         max_text_len = (
             max_seq_len - num_image_tokens - 33
             if use_chat_template
@@ -72,16 +71,16 @@ def get_hyper_params(
         patch_size = 1
     elif generation_mode == "t2i_pixel":
         calculated_seq_len = (
-            latent_width * latent_height * 1 + int(add_aspect_ratio_embeds) * 2 + 1024
+            latent_width * latent_height * latent_frames
+            + int(add_aspect_ratio_embeds) * 2
+            + 1024
         )
-        # Choose between 2048 or 5120 based on which is closer to calculated value
-        diff_2048 = abs(calculated_seq_len - 2048)
-        diff_5120 = abs(calculated_seq_len - 5120)
-        max_seq_len = 2048 if diff_2048 <= diff_5120 else 5120
+        candidates = [2048, 5120, 8192, 16384, 32768]
+        max_seq_len = next((x for x in candidates if x >= calculated_seq_len), candidates[-1])
         max_text_len = (
-            max_seq_len - num_image_tokens - 33
+            max_seq_len - (num_video_tokens if latent_frames > 1 else num_image_tokens) - 33
             if use_chat_template
-            else max_seq_len - num_image_tokens - 4
+            else max_seq_len - (num_video_tokens if latent_frames > 1 else num_image_tokens) - 4
         )
         image_latent_dim = 3
         patch_size = 16
@@ -236,7 +235,9 @@ class Tuna2PixelPipeline(TunaPipelineBase):
             self.generation_mode,
             self.latent_frames,
         )
-        if self.generation_mode == "t2i":
+        if self.generation_mode == "t2i_pixel" and self.latent_frames > 1:
+            self.num_visual_tokens = self.num_video_tokens
+        elif self.generation_mode in {"t2i", "t2i_pixel", "edit"}:
             self.num_visual_tokens = self.num_image_tokens
         else:
             self.num_visual_tokens = self.num_video_tokens
@@ -560,6 +561,385 @@ class Tuna2PixelPipeline(TunaPipelineBase):
         images = self._decode_latents(samples)
         return images
 
+    def _load_video_frames(self, path: str) -> list[Image.Image]:
+        import os
+
+        video_exts = (".mp4", ".avi", ".mov", ".mkv", ".webm")
+        if os.path.isdir(path):
+            frame_files = sorted(
+                f
+                for f in os.listdir(path)
+                if f.lower().endswith((".jpg", ".jpeg", ".png"))
+            )
+            if not frame_files:
+                raise RuntimeError(f"Frame directory has no images: {path}")
+            frames = []
+            for fname in frame_files:
+                with Image.open(os.path.join(path, fname)) as img:
+                    frames.append(img.convert("RGB"))
+            return frames
+        if path.lower().endswith(video_exts):
+            import cv2
+
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open video file: {path}")
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total <= 0:
+                raise RuntimeError(f"Video has no frames: {path}")
+            indices = [int(i * total / self.latent_frames) for i in range(self.latent_frames)]
+            frames = []
+            for idx in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, bgr = cap.read()
+                if not ok:
+                    if frames:
+                        frames.append(frames[-1].copy())
+                        continue
+                    raise RuntimeError(f"Failed to read frame {idx} from {path}")
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(rgb))
+            cap.release()
+            return frames
+        with Image.open(path) as img:
+            return [img.convert("RGB")]
+
+    def _coerce_visual_tensor(self, value: Any, kind: str) -> torch.Tensor:
+        transform = build_image_transform((self.height, self.width), center_crop=True)
+        if isinstance(value, torch.Tensor):
+            tensor = value.to(self.device, self.weight_dtype)
+            if tensor.dim() == 5:
+                tensor = tensor[0]
+            if tensor.dim() == 3:
+                tensor = tensor.unsqueeze(1)
+            if tensor.dim() != 4:
+                raise ValueError("Visual tensor segments need shape [C,H,W] or [C,T,H,W]")
+            return tensor
+        if isinstance(value, Image.Image):
+            tensor = transform(value.convert("RGB")).to(self.device, self.weight_dtype)
+            return tensor.unsqueeze(1)
+        if isinstance(value, (list, tuple)):
+            frames = []
+            for frame in value:
+                if isinstance(frame, Image.Image):
+                    frames.append(transform(frame.convert("RGB")))
+                elif isinstance(frame, torch.Tensor):
+                    frames.append(frame)
+                else:
+                    with Image.open(str(frame)) as img:
+                        frames.append(transform(img.convert("RGB")))
+            return torch.stack(frames, dim=1).to(self.device, self.weight_dtype)
+        if isinstance(value, str):
+            frames = self._load_video_frames(value) if kind == "video" else self._load_video_frames(value)
+            if len(frames) > self.latent_frames:
+                indices = [int(i * len(frames) / self.latent_frames) for i in range(self.latent_frames)]
+                frames = [frames[i] for i in indices]
+            while len(frames) < self.latent_frames:
+                frames.append(frames[-1].copy())
+            tensors = [transform(frame.convert("RGB")) for frame in frames]
+            return torch.stack(tensors, dim=1).to(self.device, self.weight_dtype)
+        raise ValueError("Visual segments need `path`, `image`, `video`, `frames`, or `tensor`")
+
+    def _normalise_mixed_segments(self, segments: List[dict[str, Any]]) -> list[dict[str, Any]]:
+        out = []
+        for segment in segments:
+            kind = str(segment.get("type", "")).lower()
+            if kind == "text":
+                text = str(segment.get("text", ""))
+                if text:
+                    out.append({"type": "text", "text": text})
+            elif kind in {"image", "video"}:
+                if "tensor" in segment:
+                    value = segment["tensor"]
+                elif "image" in segment:
+                    value = segment["image"]
+                elif "video" in segment:
+                    value = segment["video"]
+                elif "frames" in segment:
+                    value = segment["frames"]
+                else:
+                    value = segment.get("path")
+                tensor = self._coerce_visual_tensor(value, kind)
+                if tensor.shape[1] == 1 and self.latent_frames > 1:
+                    tensor = tensor.repeat(1, self.latent_frames, 1, 1)
+                out.append({"type": kind, "tensor": tensor})
+            else:
+                raise ValueError(f"Unknown mixed segment type: {kind!r}")
+        return out
+
+    def _build_mixed_tokens(
+        self,
+        segments: List[dict[str, Any]],
+        include_target_image: bool = False,
+        null_text: bool = False,
+        negative_prompt: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokens = [self.bos_id]
+        modality_positions = []
+        image_tensors = []
+        used_null_prompt = False
+        for segment in segments:
+            if segment["type"] == "text":
+                if null_text:
+                    text = negative_prompt if negative_prompt is not None and not used_null_prompt else ""
+                    used_null_prompt = True
+                else:
+                    text = segment["text"]
+                tokens.extend(self.text_tokenizer(text, add_special_tokens=False).input_ids)
+            else:
+                is_video = segment["type"] == "video" or segment["tensor"].shape[1] > 1
+                tokens.append(self.bov_id if is_video else self.boi_id)
+                offset = len(tokens)
+                pad_token = self.vid_pad_id if is_video else self.img_pad_id
+                tokens.extend([pad_token] * self.num_visual_tokens)
+                modality_positions.append([offset, self.num_visual_tokens])
+                tokens.append(self.eov_id if is_video else self.eoi_id)
+                image_tensors.append(segment["tensor"])
+
+        if include_target_image:
+            is_video = self.latent_frames > 1
+            tokens.append(self.bov_id if is_video else self.boi_id)
+            offset = len(tokens)
+            pad_token = self.vid_pad_id if is_video else self.img_pad_id
+            tokens.extend([pad_token] * self.num_visual_tokens)
+            modality_positions.append([offset, self.num_visual_tokens])
+            tokens.append(self.eov_id if is_video else self.eoi_id)
+
+        text_tokens = torch.tensor(tokens, device=self.device).unsqueeze(0)
+        if modality_positions:
+            modality_positions_t = torch.tensor(
+                modality_positions, device=self.device, dtype=torch.long
+            ).unsqueeze(0)
+        else:
+            modality_positions_t = torch.empty(
+                1, 0, 2, device=self.device, dtype=torch.long
+            )
+
+        if image_tensors:
+            images = torch.stack(image_tensors, dim=0)
+        else:
+            images = torch.empty(
+                0,
+                self.image_latent_dim,
+                self.latent_frames,
+                self.latent_height * self.patch_size,
+                self.latent_width * self.patch_size,
+                device=self.device,
+                dtype=self.weight_dtype,
+            )
+        return text_tokens, modality_positions_t, images
+
+    @torch.no_grad()
+    def mixed_modal_generate(
+        self,
+        segments: List[dict[str, Any]],
+        max_new_items: int = 4,
+        max_new_text_tokens: int = 160,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 0.0,
+        negative_prompt: Optional[str] = None,
+        sampling_method: str = "euler",
+        atol: float = 1e-6,
+        rtol: float = 1e-3,
+        reverse: bool = False,
+        time_shifting_factor: float = 3.0,
+        noise_level: float = 1.0,
+        noise_scale: float = 1.0,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+    ) -> list[dict[str, Any]]:
+        """Generate future interleaved text and images from an ordered prefix.
+
+        This is the Tuna-2 counterpart of Show-o2 mixed-modality generation:
+        previous generated text/images are appended to the context, and a BOI
+        token emitted by the language model triggers image denoising for the
+        next visual span.
+        """
+        self._init_hyperparams(self.height, self.width)
+        context = self._normalise_mixed_segments(segments)
+        generated: list[dict[str, Any]] = []
+
+        from tuna.models.jit_utils import JiTSampler
+
+        sampler = JiTSampler(self.device, noise_scale=noise_scale)
+        sample_fn, _ = sampler.sample_ode(
+            sampling_method=sampling_method,
+            num_steps=num_inference_steps,
+            atol=atol,
+            rtol=rtol,
+            reverse=reverse,
+            time_shifting_factor=time_shifting_factor,
+            noise_level=noise_level,
+        )
+
+        for _ in range(max_new_items):
+            text_tokens, modality_positions, context_images = self._build_mixed_tokens(
+                context, include_target_image=False
+            )
+            if context_images.shape[0] > 0:
+                t = torch.ones(
+                    context_images.shape[0],
+                    device=self.device,
+                    dtype=self.weight_dtype,
+                )
+                attention_mask, _ = self.model.create_attention_mask(
+                    1,
+                    text_tokens.size(1),
+                    modality_positions,
+                    self.device,
+                    self.weight_dtype,
+                )
+                input_embeds = self.model.tuna_model(
+                    text_tokens=text_tokens,
+                    image_latents=context_images,
+                    t=t,
+                    attention_mask=attention_mask,
+                    modality_positions=modality_positions,
+                    output_hidden_states=True,
+                    max_seq_len=text_tokens.size(1),
+                    return_input_embeds=True,
+                )
+            else:
+                attention_mask, _ = self.model.create_attention_mask(
+                    1,
+                    text_tokens.size(1),
+                    modality_positions,
+                    self.device,
+                    self.weight_dtype,
+                )
+                input_embeds = self.model.tuna_model.tuna.model.embed_tokens(text_tokens)
+
+            output_tokens = self.model.tuna_model.mmu_generate(
+                input_embeds=input_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_text_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                eos_token=self.boi_id,
+            )
+            if not output_tokens:
+                break
+            token_ids = [
+                int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+                for t in output_tokens
+            ]
+            hit_boi = token_ids[-1] == self.boi_id
+            text_ids = token_ids[:-1] if hit_boi else token_ids
+            text = self.text_tokenizer.decode(text_ids, skip_special_tokens=True).strip()
+            if text:
+                text_segment = {"type": "text", "text": text}
+                context.append(text_segment)
+                generated.append(text_segment)
+            if not hit_boi:
+                break
+
+            text_tokens, modality_positions, context_images = self._build_mixed_tokens(
+                context, include_target_image=True
+            )
+            z = noise_scale * torch.randn(
+                (
+                    1,
+                    self.image_latent_dim,
+                    self.latent_frames,
+                    self.latent_height * self.patch_size,
+                    self.latent_width * self.patch_size,
+                ),
+                device=self.device,
+                dtype=self.weight_dtype,
+            )
+
+            if guidance_scale > 0:
+                (
+                    text_tokens_null,
+                    modality_positions_null,
+                    context_images_null,
+                ) = self._build_mixed_tokens(
+                    context,
+                    include_target_image=True,
+                    null_text=True,
+                    negative_prompt=negative_prompt,
+                )
+                max_len = max(text_tokens.size(1), text_tokens_null.size(1))
+                if text_tokens.size(1) < max_len:
+                    text_tokens = torch.cat(
+                        [
+                            text_tokens,
+                            torch.full(
+                                (1, max_len - text_tokens.size(1)),
+                                self.pad_id,
+                                device=self.device,
+                                dtype=text_tokens.dtype,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                if text_tokens_null.size(1) < max_len:
+                    text_tokens_null = torch.cat(
+                        [
+                            text_tokens_null,
+                            torch.full(
+                                (1, max_len - text_tokens_null.size(1)),
+                                self.pad_id,
+                                device=self.device,
+                                dtype=text_tokens_null.dtype,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                z = torch.cat([z, z], dim=0)
+                text_tokens = torch.cat([text_tokens, text_tokens_null], dim=0)
+                modality_positions = torch.cat([modality_positions, modality_positions_null], dim=0)
+                context_images = torch.stack([context_images, context_images_null], dim=0)
+            else:
+                context_images = context_images.unsqueeze(0)
+
+            attention_mask, diffhead_attention_mask = self.model.create_attention_mask(
+                text_tokens.size(0),
+                text_tokens.size(1),
+                modality_positions,
+                self.device,
+                self.weight_dtype,
+            )
+            model_kwargs = {
+                "text_tokens": text_tokens,
+                "attention_mask": attention_mask,
+                "diffhead_attention_mask": diffhead_attention_mask,
+                "modality_positions": modality_positions,
+                "output_hidden_states": True,
+                "max_seq_len": text_tokens.size(1),
+                "guidance_scale": guidance_scale,
+                "context_image_latents": context_images,
+            }
+            samples = sample_fn(
+                z,
+                self.model.tuna_model.mixed_modal_generate,
+                **model_kwargs,
+            )[-1]
+            if guidance_scale > 0:
+                samples = torch.chunk(samples, 2)[0]
+            decoded_visual = self._decode_latents(samples)[0]
+            tensor_image = samples[0].squeeze(1).detach()
+            if isinstance(decoded_visual, list):
+                image_segment = {
+                    "type": "video",
+                    "frames": decoded_visual,
+                    "tensor": tensor_image,
+                }
+            else:
+                image_segment = {
+                    "type": "image",
+                    "image": decoded_visual,
+                    "tensor": tensor_image,
+                }
+            context.append(image_segment)
+            generated.append(image_segment)
+
+        return generated
+
     def _decode_latents(self, latents: torch.Tensor) -> List[Image.Image]:
         """
         Decode latents to PIL images. The pure-pixel variant has no VAE, so the
@@ -581,7 +961,12 @@ class Tuna2PixelPipeline(TunaPipelineBase):
         else:
             images = latents
 
-        if images.shape[2] == 1:
+        if images.dim() == 5 and images.shape[2] > 1:
+            images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0).to(torch.float32)
+            images = (images * 255.0).permute(0, 2, 3, 4, 1).cpu().numpy().astype(np.uint8)
+            return [[Image.fromarray(frame) for frame in sample] for sample in images]
+
+        if images.dim() == 5 and images.shape[2] == 1:
             images = images.squeeze(2)
 
         # Convert to PIL images

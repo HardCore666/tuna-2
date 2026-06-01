@@ -100,6 +100,7 @@ class JiTWrapperMixin:
         pixel_values: torch.Tensor,
         data_type: List[str],
         image_masks: torch.Tensor,
+        image_target_masks: torch.Tensor | None = None,
         use_feature: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """JiT formulation: ``z_t = t * x + (1-t) * noise``.
@@ -114,7 +115,19 @@ class JiTWrapperMixin:
         t_list, xt_list, x0_list, masks = [], [], [], []
 
         for i, tp in enumerate(data_type):
-            if tp == "edit_interleaved":
+            is_target_image = True
+            images_per_sample = 1
+            if image_target_masks is not None:
+                images_per_sample = int(image_target_masks.shape[-1])
+                is_target_image = bool(image_target_masks.flatten()[i].item())
+
+            if tp == "temporal_interleaved":
+                # Show-o2-style mixed-modality training keeps the retained
+                # prefix images as clean context and only denoises future
+                # images. Do not tie this to `und_max_t0`, which is an MMU
+                # regularization knob.
+                max_t0 = None if is_target_image else 1.0
+            elif tp == "edit_interleaved":
                 is_first_image = i % 2 == 0
                 max_t0 = self.und_max_t0 if is_first_image else None
             elif tp in [
@@ -122,7 +135,7 @@ class JiTWrapperMixin:
                 "mmu_vid",
                 "mmu_interleaved",
                 "mmu_text",
-                            ]:
+            ]:
                 import random
 
                 if self.mmu_noise_prob > 0 and random.random() < self.mmu_noise_prob:
@@ -147,7 +160,13 @@ class JiTWrapperMixin:
                 # accumulate, the final masks output stays None.
                 continue
 
-            if (
+            if tp == "temporal_interleaved":
+                # The sequence-level image mask already marks only future
+                # images. Prefix images stay clean context and do not
+                # contribute to the flow/JiT loss.
+                if i % images_per_sample == 0:
+                    masks.append(image_masks[i // images_per_sample][None])
+            elif (
                 tp in ["mmu", "mmu_vid", "mmu_interleaved", "mmu_text"]
                 and self.und_max_t0 == 1.0
             ):

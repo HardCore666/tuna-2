@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 
 import hydra
 import torch
@@ -52,6 +53,15 @@ def _make_data_for_mode(cfg: DictConfig) -> dict:
             raise ValueError("predict (mmu) requires an `image_path` override.")
         image = Image.open(image_path).convert("RGB")
         return {"image": [image]}
+    if mode in {"mixed_modal", "temporal_interleaved"}:
+        if cfg.get("segments", None) is not None:
+            return {"segments": OmegaConf.to_container(cfg.segments, resolve=True)}
+        segments_path = cfg.get("segments_path", None)
+        if segments_path is None:
+            raise ValueError("predict (mixed_modal) requires `segments` or `segments_path`.")
+        with open(segments_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return {"segments": payload.get("segments", payload)}
     raise ValueError(f"Unknown inference_mode: {mode!r}")
 
 

@@ -1,0 +1,19 @@
+# Encoder-free temporal interleaved image/video-text training config.
+# Visual spans are raw pixel clips: [C, T, H, W]. Images are represented as
+# static clips when num_frames > 1, so the Tuna-2 pixel patch/JiT path remains
+# native and does not introduce a VAE or external visual encoder.
+
+defaults:
+  - train_temporal_interleaved
+  - _self_
+
+data:
+  streams:
+    temporal:
+      jsonl_path: ./data_examples/temporal_interleaved.jsonl
+      image_size: 512
+      num_frames: 4
+      max_text_length: 16384
+
+training:
+  output_dir: ./outputs/train_temporal_interleaved_video

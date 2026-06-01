@@ -46,6 +46,32 @@ The released foundation checkpoint has a small number of layers randomly re-init
 {"raw_image": "imgs/edit0.png", "out_image": "imgs/edit0_target.png", "instruction": "add warm golden sunset lighting to the scene"}
 ```
 
+### Temporal Interleaved Prediction
+
+Show-o2-style mixed-modality training is supported through
+`TemporalInterleavedDataset`. The sequence is ordered in time; an early prefix
+is kept as clean context, while future text tokens and future visual spans
+become the training targets. Visual spans may be images or videos. In the
+Tuna-2 pixel variant, videos are encoder-free raw frame tensors `[C, T, H, W]`
+patchified by the native Conv2d patch embedder; no VAE or external visual
+encoder is introduced.
+
+```jsonl
+{"images": ["story/0001.jpg", "story/0002.jpg", "story/0003.jpg"], "captions": ["A child walks into the kitchen.", "She reaches for a cup.", "Then she pours milk into it."]}
+```
+
+For full control, use explicit segments and optional `target` flags:
+
+```jsonl
+{"sequence": [{"type": "text", "text": "A child walks into the kitchen.", "target": false}, {"type": "image", "path": "story/0001.jpg", "target": false}, {"type": "text", "text": "She reaches for a cup.", "target": true}, {"type": "image", "path": "story/0002.jpg", "target": true}]}
+```
+
+Video spans use the same format:
+
+```jsonl
+{"sequence": [{"type": "text", "text": "The clip opens on a kitchen counter.", "target": false}, {"type": "video", "path": "clips/0001.mp4", "target": false}, {"type": "text", "text": "Next the camera follows the cup.", "target": true}, {"type": "video", "path": "clips/0002_frames", "target": true}]}
+```
+
 See `data_examples/` for complete working examples of each format.
 
 ## Training Config
@@ -56,7 +82,7 @@ All configuration uses [Hydra](https://hydra.cc/). Any field can be overridden o
 
 ### Data Streams
 
-Four data streams mixed by weighted sampling:
+The default recipe uses four data streams mixed by weighted sampling:
 
 | Stream | Weight | Data Type | max_text_length | batch_size | Description |
 |---|---|---|---|---|---|
@@ -64,6 +90,12 @@ Four data streams mixed by weighted sampling:
 | `edit` | 20% | `edit_interleaved` | 4096 | 3 | Image editing |
 | `mmu` | 20% | `mmu` | 4096 | 3 | Multimodal understanding |
 | `text` | 10% | `mmu_text` | 4096 | 3 | Text-only conversations |
+
+The default `configs/train/train.yaml` remains the original four-stream
+recipe. Use `--config-name train_temporal_interleaved` to enable an additional
+5% `temporal_interleaved` stream for prefix-to-future interleaved text/image
+prediction. Use `--config-name train_temporal_interleaved_video` or override
+`data.streams.temporal.num_frames=N` to train encoder-free video spans.
 
 Each stream can have its own `batch_size` and `num_workers`. If omitted, the global `training.batch_size` / `training.num_workers` are used as fallback.
 
