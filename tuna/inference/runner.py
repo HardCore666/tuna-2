@@ -465,12 +465,25 @@ class TunaInference:
                     cfg_interval=self.cfg_interval,
                 )
 
-            images_tensor = pil_to_tensor(pil_images)
-            if images_tensor.dim() == 4:
-                for img in images_tensor:
-                    all_images.append(img)
+            if (
+                isinstance(pil_images, list)
+                and pil_images
+                and isinstance(pil_images[0], list)
+            ):
+                for frames in pil_images:
+                    frame_tensors = [
+                        tvF.pil_to_tensor(frame).to(torch.float32) / 255.0
+                        for frame in frames
+                    ]
+                    video_tensor = torch.stack(frame_tensors, dim=1)
+                    all_images.append(video_tensor)
             else:
-                all_images.append(images_tensor)
+                images_tensor = pil_to_tensor(pil_images)
+                if images_tensor.dim() == 4:
+                    for img in images_tensor:
+                        all_images.append(img)
+                else:
+                    all_images.append(images_tensor)
 
             if save_name_prefix:
                 save_paths.append(f"{save_name_prefix}-{i}.png")

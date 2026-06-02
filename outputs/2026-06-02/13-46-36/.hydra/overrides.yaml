@@ -1,0 +1,3 @@
+- training.max_steps_per_epoch=1
+- training.batch_size=1
+- training.fsdp.enable=false

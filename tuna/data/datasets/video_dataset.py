@@ -70,6 +70,9 @@ class VideoDataset(Dataset):
         video_field: str = "video",
         text_field: str = "caption",
         center_crop: bool = True,
+        encoder_free: bool = False,
+        patch_size: int = 16,
+        include_time_token: bool = True,
         tuna_token_ids: dict[str, int] | None = None,
         **kwargs,
     ) -> None:
@@ -84,19 +87,32 @@ class VideoDataset(Dataset):
         self.max_text_length = max_text_length
         self.video_field = video_field
         self.text_field = text_field
+        self.encoder_free = encoder_free
+        self.patch_size = patch_size
+        self.include_time_token = include_time_token
 
         self.records = self._load_jsonl(jsonl_path)
         self.image_transform = build_image_transform(self.image_size, center_crop)
 
-        # Wan2.2 VAE downsamples 16x spatial and 4x temporal (with causal conv).
-        # Latent shape: [B, 48, T_latent, H/16, W/16].
-        spatial_ds = 16
-        temporal_ds = 4
-        latent_h = self.image_size[0] // spatial_ds
-        latent_w = self.image_size[1] // spatial_ds
-        latent_t = (num_frames + temporal_ds - 2) // temporal_ds + 1  # causal conv formula
-        self.num_tokens_per_frame = latent_h * latent_w
-        self.num_image_tokens = self.num_tokens_per_frame * latent_t + 1
+        if encoder_free:
+            # Tuna-2 pixel path: raw frames are patchified directly, with no VAE
+            # temporal downsampling and no external visual encoder.
+            latent_h = self.image_size[0] // patch_size
+            latent_w = self.image_size[1] // patch_size
+            self.num_tokens_per_frame = latent_h * latent_w
+            self.num_image_tokens = self.num_tokens_per_frame * num_frames
+            if include_time_token:
+                self.num_image_tokens += 1
+        else:
+            # Wan2.2 VAE downsamples 16x spatial and 4x temporal (with causal conv).
+            # Latent shape: [B, 48, T_latent, H/16, W/16].
+            spatial_ds = 16
+            temporal_ds = 4
+            latent_h = self.image_size[0] // spatial_ds
+            latent_w = self.image_size[1] // spatial_ds
+            latent_t = (num_frames + temporal_ds - 2) // temporal_ds + 1
+            self.num_tokens_per_frame = latent_h * latent_w
+            self.num_image_tokens = self.num_tokens_per_frame * latent_t + 1
 
         if tuna_token_ids is not None:
             self.bos_id = tuna_token_ids["bos_id"]
@@ -111,7 +127,7 @@ class VideoDataset(Dataset):
         logger.info(
             f"VideoDataset: loaded {len(self.records)} records from {jsonl_path} "
             f"(num_frames={num_frames}, image_size={self.image_size}, "
-            f"num_image_tokens={self.num_image_tokens})"
+            f"encoder_free={encoder_free}, num_image_tokens={self.num_image_tokens})"
         )
 
     @staticmethod

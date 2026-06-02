@@ -1,0 +1,44 @@
+# Encoder-free Tuna-2 pixel text-to-video training.
+# This is the native raw-frame counterpart of the VAE `video_t2v.yaml` route.
+
+defaults:
+  - model: tuna_2_pixel_7b
+  - _self_
+
+data:
+  _target_: tuna.data.datasets.video_dataset.VideoDataset
+  jsonl_path: ./data_examples/video_pairs.jsonl
+  image_root: ./data_examples
+  image_size: 512
+  num_frames: 4
+  encoder_free: true
+  patch_size: 16
+  include_time_token: true
+  max_text_length: 8192
+  center_crop: true
+  batch_size: 1
+  num_workers: 4
+
+training:
+  output_dir: ./outputs/video_t2v_pixel
+  max_epochs: 1
+  max_steps_per_epoch: 1000000
+  learning_rate: 2.0e-5
+  weight_decay: 1.0e-2
+  warmup_steps: 1000
+  batch_size: 1
+  num_workers: 4
+  gradient_accumulation_steps: 1
+  mixed_precision: bf16
+  ema_decay: 0.9999
+  save_every: 500
+  keep_last: 3
+  gc_interval: 5001
+  fsdp:
+    enable: true
+    sharding_strategy: SHARD_GRAD_OP
+    state_dict_type: SHARDED_STATE_DICT
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      cast_root_forward_inputs: true

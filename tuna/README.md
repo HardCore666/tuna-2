@@ -233,3 +233,20 @@ torchrun ... -m tuna.scripts.train \
 python -m tuna.scripts.train seed=42
 ```
 
+## Encoder-Free T2V Pixel Route
+
+Tuna-2 pixel now has a standalone native text-to-video route, separate from
+the VAE video configs and separate from temporal interleaved training.
+
+```bash
+python -m tuna.scripts.train --config-name video_t2v_pixel \
+    model.load_stage1_model=/path/to/foundation_ckpt.pt
+
+python -m tuna.scripts.predict --config-name t2v_pixel \
+    prompt="a short video of a croissant on a plate"
+```
+
+`video_t2v_pixel` uses `VideoDataset encoder_free=true`: videos are loaded as
+raw `[C, T, H, W]` frame tensors and patchified directly by Tuna-2. The older
+`video_t2v.yaml` / `t2v_2b.yaml` route remains the VAE-video path.
+

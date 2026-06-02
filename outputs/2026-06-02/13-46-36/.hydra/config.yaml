@@ -1,0 +1,137 @@
+model:
+  _target_: tuna.models.tuna_2_pixel.Tuna2PixelModel
+  llm_model_path: Qwen/Qwen2.5-7B-Instruct
+  load_stage1_model: null
+  frozen_params:
+  - vae
+  hidden_size: 3584
+  num_attention_heads: 56
+  num_key_value_heads: 14
+  attention_backend: sdpa
+  patch_size: 16
+  image_latent_dim: 3
+  image_latent_height: 16
+  image_latent_width: 16
+  hq_image_latent_height: 64
+  hq_image_latent_width: 64
+  mixed_modal_latent_height: 32
+  mixed_modal_latent_width: 32
+  add_time_embeds: true
+  add_aspect_ratio_embeds: false
+  mrope_type: dit_3drope_mm
+  reshape_frame_to_batch_dim: false
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  enable_mask_token: true
+  masked_image_ratio: 0.3
+  masked_image_ratio_min: -0.7
+  mmu_noise_prob: 0.1
+  mmu_noise_level: 0.1
+  path_type: Linear
+  prediction: velocity
+  snr_type: lognorm
+  do_shift: true
+  ntp_coeff: 1.0
+  flow_coeff: 1.0
+  und_max_t0: 1.0
+  sampling_method: euler
+  guidance_scale: 7.5
+  num_inference_steps: 50
+  time_shifting_factor: 3.0
+  atol: 1.0e-06
+  rtol: 0.001
+  reverse: false
+  dtype: bf16
+  flow_head_num: 16
+  noise_scale: 2.0
+data:
+  sync_sampling: true
+  sampling_weights:
+    t2i: 0.45
+    edit: 0.2
+    mmu: 0.2
+    text: 0.1
+    temporal: 0.05
+  streams:
+    t2i:
+      _target_: tuna.data.datasets.ti_dataset.TIDataset
+      jsonl_path: ./data_examples/ti_pairs.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      data_type: t2i
+      max_text_length: 2048
+      center_crop: true
+      multi_resolution: true
+      batch_size: 1
+      num_workers: 8
+    edit:
+      _target_: tuna.data.datasets.edit_dataset.EditDataset
+      jsonl_path: ./data_examples/edit_pairs.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      max_text_length: 4096
+      center_crop: true
+      batch_size: 1
+      num_workers: 8
+    mmu:
+      _target_: tuna.data.datasets.ti_dataset.TIDataset
+      jsonl_path: ./data_examples/mmu_pairs.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      data_type: mmu
+      max_text_length: 4096
+      center_crop: true
+      multi_resolution: true
+      batch_size: 1
+      num_workers: 8
+    text:
+      _target_: tuna.data.datasets.ti_dataset.TIDataset
+      jsonl_path: ./data_examples/text_only.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      data_type: mmu_text
+      max_text_length: 4096
+      center_crop: true
+      batch_size: 3
+      num_workers: 8
+    temporal:
+      _target_: tuna.data.datasets.temporal_interleaved_dataset.TemporalInterleavedDataset
+      jsonl_path: ./data_examples/temporal_interleaved.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      num_frames: 1
+      max_text_length: 8192
+      max_images: 5
+      center_crop: true
+      include_time_token: true
+      noise_all_images_prob: 0.3
+      min_prefix_images: 1
+      condition_dropout_prob: 0.1
+      drop_prefix_text_prob: 0.1
+      drop_prefix_visual_prob: 0.0
+      batch_size: 1
+      num_workers: 4
+training:
+  output_dir: ./outputs/train_temporal_interleaved
+  max_epochs: 1
+  max_steps_per_epoch: 1
+  learning_rate: 2.0e-05
+  weight_decay: 0.01
+  warmup_steps: 1000
+  batch_size: 1
+  num_workers: 8
+  gradient_accumulation_steps: 1
+  mixed_precision: bf16
+  ema_decay: 0.9999
+  save_every: 500
+  keep_last: 3
+  gc_interval: 5001
+  fsdp:
+    enable: false
+    sharding_strategy: SHARD_GRAD_OP
+    state_dict_type: SHARDED_STATE_DICT
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      cast_root_forward_inputs: true

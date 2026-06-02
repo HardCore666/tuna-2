@@ -18,13 +18,14 @@ import logging
 from typing import Any, Callable
 
 import torch
+from typing import Union
 from torchtnt.framework import PredictUnit
 from torchtnt.framework.state import State
 
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-TorchDevice = str | torch.device
+TorchDevice = Union[str, torch.device]
 
 
 class TunaPredUnit(PredictUnit):
